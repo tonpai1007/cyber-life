@@ -85,17 +85,46 @@ A headless parameter sweep (seeds × rules × storm frequency → diversity /
 fitness curves) is the natural next step; it will use the same seeded PRNG,
 so results are comparable across the UI and the CLI.
 
+## 🧪 Ablation study (v5.1)
+
+Does the cosmic-storm *fitness gate* actually help, or would random rule
+switching do the same? 30 paired seeds × 3 conditions × 400 generations,
+sharing the app's engine ([`docs/ablation_study.md`](docs/ablation_study.md)):
+
+| Metric (tail-mean) | fixed | storm-gated | storm-null |
+|---|---|---|---|
+| Population | 154.6 | **907.7** | 826.1 |
+| Connected components | 25.4 | **80.4** | 43.5 |
+| Gene diversity | 37.5 | 70.9 | 69.7 |
+| Composite fitness | 3.43 | **4.74** | 4.29 |
+
+- Storms dominate fixed `B3/S23` on every metric.
+- **Gating vs random switching:** significant for components (t = 6.19,
+  p ≈ 5 × 10⁻⁸) and fitness (t = 4.01, p ≈ 2 × 10⁻⁴); **not** significant
+  for diversity (t = 0.24, p ≈ 0.81).
+- Reading: gating builds coherence, not variety. See the dendrogram
+  (`docs/figures/lineage_dendrogram.svg`) and diversity curves
+  (`docs/figures/diversity_curves.svg`).
+
+Reproduce: `npm run sweep` · `node tools/dendrogram.mjs`. Draft manuscript:
+[`paper/preprint.md`](paper/preprint.md).
+
 ## 📚 Docs
 
 - [`docs/concept_of_life.md`](docs/concept_of_life.md) — theory & philosophy of the model
+- [`docs/ablation_study.md`](docs/ablation_study.md) — the null-model experiment, full numbers
+- [`paper/preprint.md`](paper/preprint.md) — workshop-draft manuscript (not peer reviewed)
 - [`lecture.md`](lecture.md) — a guided walk-through (usable as talk notes)
 
 ## 🗂️ Layout
 
 ```
-src/useLifeGame.js   — simulation core (grid, rules, genes, metabolism, storms, fitness)
+src/engine.js        — pure simulation core (shared by UI and tools)
+src/useLifeGame.js   — React hook wrapper around the engine
 src/useGardener.js   — trust-gated heuristic controller
 src/useSonifier.js   — Web Audio sonification
 src/renderer.js      — canvas renderer (frame loop, particles, heatmap)
 src/App.jsx          — UI shell (HUD, sidebar, canvas, shortcuts)
+tools/sweep.mjs      — headless ablation runner (npm run sweep)
+tools/dendrogram.mjs — lineage tree SVG generator
 ```
