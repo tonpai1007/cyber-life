@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import { useLifeGame, isValidRuleStr } from './useLifeGame';
+import { parseSeedParam, randomSeed } from './prng';
 import { useGardener } from './useGardener';
 import { useSonifier } from './useSonifier';
 import { SimulationRenderer } from './renderer';
@@ -68,6 +69,9 @@ const App = () => {
   const [prompt, setPrompt] = useState("");
   const [ruleDraft, setRuleDraft] = useState("B3/S23");
   const [ruleError, setRuleError] = useState(null);
+  // Deterministic seed: ?seed=<n> reproduces a passive run exactly.
+  const [seed, setSeed] = useState(() => parseSeedParam(window.location.search) ?? randomSeed());
+  const [seedCopied, setSeedCopied] = useState(false);
   const cellSize = 10;
   const MAX_COLS = 160;
   const MAX_ROWS = 100;
@@ -162,8 +166,8 @@ const App = () => {
     geneRef, gridRef, metaRef, amplifyRegion, fertilize, suppress,
     ruleStats,
     computeMode, seedLaneFromBits, laneOutput,
-    restoreSnapshot,
-  } = useLifeGame(dimensions.cols, dimensions.rows);
+    restoreSnapshot, reseed, exportMetricsCSV,
+  } = useLifeGame(dimensions.cols, dimensions.rows, seed);
 
   // Keep the draft in sync when the engine changes rulesets externally
   // (cosmic storms). Documented "adjust state during render" pattern —
@@ -191,6 +195,42 @@ const App = () => {
     historyRef.current = newHistory;
     setHistoryIndex(newHistory.length - 1);
   }, [gridRef, historyIndex]);
+
+  const downloadMetrics = useCallback(() => {
+    const csv = exportMetricsCSV();
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cyber-life-seed-${seed}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [exportMetricsCSV, seed]);
+
+  const seedHex = seed.toString(16).toUpperCase().padStart(8, '0');
+
+  const copySeedLink = useCallback(() => {
+    const link = `${window.location.origin}${window.location.pathname}?seed=${seed}`;
+    try {
+      navigator.clipboard?.writeText(link);
+      setSeedCopied(true);
+      setTimeout(() => setSeedCopied(false), 1200);
+    } catch {
+      // Clipboard unavailable (non-secure context) — select-free fallback:
+      window.prompt('Copy this link to reproduce the run:', link);
+    }
+  }, [seed]);
+
+  const newSeed = useCallback(() => {
+    const s = randomSeed();
+    setSeed(s);
+    reseed(s);
+    try {
+      window.history.replaceState(null, '', `?seed=${s}`);
+    } catch {
+      // Non-browser context — ignore.
+    }
+  }, [reseed]);
 
   const undo = useCallback(() => {
     if (historyIndex <= 0) return;
@@ -272,7 +312,7 @@ const App = () => {
     return () => clearInterval(id);
   }, [showSidebar, active, config.autoHide]);
 
-  // Keyboard shortcuts: SPACE run, N NCA, M sound, C computation, G gaze, L logs, H autohide, Z undo
+  // Keyboard shortcuts: SPACE run, N METABOLIC, M sound, C computation, G gaze, L logs, H autohide, Z undo
   useEffect(() => {
     const onKey = (e) => {
       unlock();
@@ -284,7 +324,7 @@ const App = () => {
         setKeyFlash('SPACE');
       } else if (k === 'n') {
         setNeuralMode(m => !m);
-        setKeyFlash('NCA');
+        setKeyFlash('METABOLIC');
       } else if (k === 'm') {
         setCfg('sound');
         setKeyFlash('SOUND');
@@ -346,8 +386,19 @@ const App = () => {
     }
     const renderer = rendererRef.current;
     let rafId;
+    let renderErrorLogged = 0;
     const loop = () => {
-      if (rendererStateRef.current) renderer.update(rendererStateRef.current);
+      if (rendererStateRef.current) {
+        try {
+          renderer.update(rendererStateRef.current);
+        } catch (err) {
+          // Never let a bad frame kill the render loop — log the first few.
+          if (renderErrorLogged < 5) {
+            renderErrorLogged++;
+            console.error('[cyber-life] renderer frame failed', err);
+          }
+        }
+      }
       rafId = requestAnimationFrame(loop);
     };
     rafId = requestAnimationFrame(loop);
@@ -572,7 +623,7 @@ const App = () => {
             <div className="onboarding-hints">
               <div><span className="key">CLICK</span> SEED_CELLS</div>
               <div><span className="key">SPACE</span> RUN / PAUSE</div>
-              <div><span className="key">N</span> NEURAL_MODE</div>
+              <div><span className="key">N</span> METABOLIC_MODE</div>
               <div><span className="key">M</span> SOUND</div>
               <div><span className="key">CTRL+Z</span> UNDO</div>
             </div>
@@ -589,11 +640,11 @@ const App = () => {
       
       <header className="header panel">
         <div className="logo-group">
-            <h1 className="glitch-text">{neuralMode ? 'NEURAL_SINGULARITY' : 'CYBER-LIFE // NEURAL_NET'}</h1>
-            <span className="version">AI_EVOLVED v5.0.0</span>
+            <h1 className="glitch-text">{neuralMode ? 'CYBER-LIFE // METABOLIC_CA' : 'CYBER-LIFE // LIFE-LIKE_CA'}</h1>
+            <span className="version">v5.0.0 // METABOLIC CORE</span>
         </div>
         <div className="observer-hud panel">
-            <div className="observer-header">AI_GARDENER // LIVE_STREAM</div>
+            <div className="observer-header">GARDENER // TRUST-GATED CONTROLLER</div>
             <div className="observer-logs">
                 {(config.compactLogs ? gardener.logs.slice(0, 1) : gardener.logs).map((log, i) => (
                     <div key={i} className="log-entry" style={{ opacity: 1 - i * 0.1 }}>{log}</div>
@@ -608,9 +659,9 @@ const App = () => {
             {showSidebar ? 'CLOSE_CORE' : 'DATA_CORE'}
           </button>
           <div className="status-group">
-            <div className="status-engine">STABILITY: {isStagnant ? 'RECALIBRATING' : (neuralMode ? 'NEURAL_FLOW' : 'OPTIMAL')}</div>
+            <div className="status-engine">STABILITY: {isStagnant ? 'RECALIBRATING' : (neuralMode ? 'METABOLIC_FLOW' : 'OPTIMAL')}</div>
             <div className={`status-mode ${active ? 'active' : ''}`}>
-               {active ? (neuralMode ? 'AI_PROCESSING' : 'RUNNING_SIM') : 'STANDBY'}
+               {active ? (neuralMode ? 'METABOLIC_MODE' : 'RUNNING_SIM') : 'STANDBY'}
             </div>
           </div>
         </div>
@@ -639,13 +690,13 @@ const App = () => {
               })}
           </div>
 
-          <div className="sidebar-header" style={{ marginTop: '2rem' }}>NEURAL_CORE // NCA</div>
+          <div className="sidebar-header" style={{ marginTop: '2rem' }}>METABOLIC_CORE // SECOND_CHANNEL</div>
           <div className="config-item">
               <button 
                 className={`btn full ${neuralMode ? 'active' : ''}`} 
                 onClick={() => setNeuralMode(!neuralMode)}
               >
-                {neuralMode ? 'DEACTIVATE_NCA' : 'ACTIVATE_NCA'}
+                {neuralMode ? 'DEACTIVATE_METABOLIC' : 'ACTIVATE_METABOLIC'}
               </button>
           </div>
 
@@ -681,7 +732,7 @@ const App = () => {
               <button className={`btn ${config.chromatic ? 'active' : ''}`} onClick={() => setCfg('chromatic')}>CHROMATIC</button>
               <button className={`btn ${config.colonyWeb ? 'active' : ''}`} onClick={() => setCfg('colonyWeb')}>COLONY_WEB</button>
           </div>
-          <span className="config-hint">KEYS: SPACE=RUN M=SOUND N=NCA C=COMPUTE G=GAZE L=LOGS H=AUTOHIDE</span>
+          <span className="config-hint">KEYS: SPACE=RUN M=SOUND N=METABOLIC C=COMPUTE G=GAZE L=LOGS H=AUTOHIDE</span>
 
           <div className="sidebar-header" style={{ marginTop: '2rem' }}>SEED_GENERATOR</div>
           <div className="config-item">
@@ -752,14 +803,21 @@ const App = () => {
           </div>
           <div className="config-item">
             <label>BRUSH_SIZE: {brushSize}</label>
-            <input 
-              type="range" min="0" max="5" 
-              value={brushSize} 
-              onChange={(e) => { 
+            <input
+              type="range" min="0" max="5"
+              value={brushSize}
+              onChange={(e) => {
                 setBrushSize(parseInt(e.target.value));
                 setActivePattern(null);
-              }} 
+              }}
             />
+          </div>
+
+          <div className="sidebar-header" style={{ marginTop: '2rem' }}>DATA_CORE // METRICS</div>
+          <div className="config-item">
+            <button className="btn full" onClick={downloadMetrics}>EXPORT_FITNESS_CSV</button>
+            <span className="config-hint">GEN,RULE,POP,ENTROPY,COMPONENTS,GENE_DIVERSITY,AVG_AGE,FITNESS</span>
+            <span className="config-hint">PER-GENERATION AUDIT LOG FOR OFFLINE ANALYSIS</span>
           </div>
         </aside>
 
@@ -785,8 +843,8 @@ const App = () => {
               <span className="stat-value">{population}</span>
             </div>
             <div className="stat-item">
-              <span className="stat-label">INTEGRITY:</span>
-              <span className="stat-value">{neuralMode ? 'SYNAPSE_NC' : 'GO_L'}</span>
+              <span className="stat-label">MODE:</span>
+              <span className="stat-value">{neuralMode ? 'METABOLIC' : 'CLASSIC_LIFE'}</span>
             </div>
             <div className="stat-item">
               <span className="stat-label">GARDENER:</span>
@@ -828,13 +886,19 @@ const App = () => {
 
       <footer className="footer">
         <div className="footer-content">
-          <span>NEURAL_CELLULAR_AUTOMATA // CORE.v5_AI</span>
+          <span>LIFE-LIKE CA // METABOLIC CORE v5.0.0</span>
           <div className={`data-stream ${decodeHover ? 'decoded' : ''}`}
             data-text={streamText}
             onMouseEnter={() => setDecodeHover(true)}
             onMouseLeave={() => setDecodeHover(false)}>
           {decodeHover ? ((gardener.logs && gardener.logs[0]) || 'WAITING_FOR_SIGNAL...') : ''}
         </div>
+          <div className="seed-box" title="Deterministic seed — a passive run with this seed reproduces exactly">
+            <span className="seed-label">SEED:</span>
+            <span className="seed-hex">0x{seedHex}</span>
+            <button className="seed-btn" onClick={copySeedLink}>{seedCopied ? 'COPIED' : 'COPY_LINK'}</button>
+            <button className="seed-btn" onClick={newSeed}>NEW_SEED</button>
+          </div>
           <span className="port">PORT: 1337 // LOCALHOST</span>
         </div>
       </footer>

@@ -133,10 +133,10 @@ export class SimulationRenderer {
 
     // Birth / death particle bursts
     if (config.particles && motionEnabled) {
-      const prev = this.prevGrid;
-      if (prev.length !== grid.length) {
+      if (this.prevGrid.length !== grid.length) {
         this.prevGrid = new Uint8Array(grid);
       }
+      const prev = this.prevGrid;
       const newParticles = [];
       for (let i = 0; i < grid.length; i++) {
         if (grid[i] > 0 && !prev[i]) {

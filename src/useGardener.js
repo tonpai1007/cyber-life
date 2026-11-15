@@ -37,7 +37,7 @@ export const useGardener = (opts) => {
     cols, rows, injectPattern, mutate, amplifyRegion,
   } = opts;
 
-  const [logs, setLogs] = useState(['AI_OBSERVER: INITIALIZED. ACQUIRING_LENS...']);
+  const [logs, setLogs] = useState(['GARDENER: INITIALIZED. ACQUIRING_LENS...']);
   const [trust, setTrust] = useState(0.5);
   const [phase, setPhase] = useState('EQUILIBRIUM');
   const [focus, setFocus] = useState(null);

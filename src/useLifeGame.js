@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { mulberry32 } from './prng';
 
 // Rule strings look like "B3/S23" (letters optional, any order, digits 0-8).
 // Returns null when the string is not a valid ruleset so callers can keep the
@@ -27,11 +28,12 @@ const RULE_110 = 110;
 
 // Heredity: a gene rarely drifts by +-1 (gradual lineage branching); 2% of the
 // time it "mutates" to a random value. Storm rules raise the drift pressure,
-// which acts as selection pressure on lineage diversity.
-const driftGene = (gene, driftRate) => {
-  if (Math.random() < driftRate) {
-    if (Math.random() < 0.02) return Math.floor(Math.random() * 256);
-    return (gene + (Math.random() < 0.5 ? 1 : 255)) & 0xff;
+// which acts as selection pressure on lineage diversity. `rng` is the
+// seeded stream — keep it deterministic for reproducible runs.
+const driftGene = (gene, driftRate, rng) => {
+  if (rng() < driftRate) {
+    if (rng() < 0.02) return Math.floor(rng() * 256);
+    return (gene + (rng() < 0.5 ? 1 : 255)) & 0xff;
   }
   return gene;
 };
@@ -49,16 +51,21 @@ export const nextAlive = ({ cell, neighbors, avgMeta, b, s, neuralMode }) => {
 // Pure Rule 110 lookup for a single triple.
 export const rule110Bit = (l, c, r) => (RULE_110 >> ((l << 2) | (c << 1) | r)) & 1;
 
-export const useLifeGame = (cols, rows) => {
+export const useLifeGame = (cols, rows, seed = 1) => {
   const [active, setActive] = useState(false);
   const [generation, setGeneration] = useState(0);
   const [isStagnant, setIsStagnant] = useState(false);
   const [lastMutation, setLastMutation] = useState(null);
   const [ruleStr, setRuleStr] = useState('B3/S23');
+  // Seeded PRNG stream — the single source of randomness for the whole
+  // simulation so a given seed reproduces a world exactly (passive runs).
+  const rngRef = useRef(mulberry32(seed >>> 0));
+  // Audit log of per-generation metrics (for CSV export / offline analysis).
+  const metricsRef = useRef([]);
   const [grid, setGrid] = useState(() => {
     const g = new Uint8Array(cols * rows);
     for (let i = 0; i < g.length; i++) {
-      if (Math.random() > 0.85) g[i] = 1;
+      if (rngRef.current() > 0.85) g[i] = 1;
     }
     return g;
   });
@@ -148,7 +155,7 @@ export const useLifeGame = (cols, rows) => {
     const newGrid = new Uint8Array(cols * rows);
     if (source === true) {
       for (let i = 0; i < newGrid.length; i++) {
-        if (Math.random() > 0.85) newGrid[i] = 1;
+        if (rngRef.current() > 0.85) newGrid[i] = 1;
       }
     } else if (source instanceof Uint8Array && source.length === newGrid.length) {
       newGrid.set(source);
@@ -159,6 +166,7 @@ export const useLifeGame = (cols, rows) => {
     gridRef.current.set(newGrid);
     geneRef.current.fill(0);
     metaRef.current.fill(0);
+    metricsRef.current = [];
     setGrid(new Uint8Array(newGrid));
     setGeneration(0);
     setIsStagnant(false);
@@ -191,11 +199,35 @@ export const useLifeGame = (cols, rows) => {
   // with it (heritage genes, metabolism, generation, stagnation, mutation pulse,
   // compute lane). History lives in the hook so undo can never touch the React
   // setters directly from the component tree.
+  const reseed = useCallback((newSeed) => {
+    rngRef.current = mulberry32((newSeed >>> 0) || 1);
+    metricsRef.current = [];
+    initGrid();
+  }, [initGrid]);
+
+  const exportMetricsCSV = useCallback(() => {
+    const header = 'generation,rule,population,entropy,components,diversity,avgAge,fitness\n';
+    const lines = metricsRef.current.map((m) =>
+      [
+        m.generation,
+        m.rule,
+        m.population,
+        m.entropy.toFixed(6),
+        m.components,
+        m.diversity,
+        m.avgAge.toFixed(4),
+        m.score.toFixed(6),
+      ].join(',')
+    );
+    return header + lines.join('\n') + (lines.length ? '\n' : '');
+  }, []);
+
   const restoreSnapshot = useCallback((snapshot) => {
     if (!(snapshot instanceof Uint8Array)) return false;
     // Undo across a resize is meaningless (the old snapshot's row stride no
     // longer matches) — reject rather than scramble the world.
     if (snapshot.length !== gridRef.current.length) return false;
+    metricsRef.current = [];
     gridRef.current.set(snapshot);
     geneRef.current.fill(0);
     metaRef.current.fill(0);
@@ -233,11 +265,11 @@ export const useLifeGame = (cols, rows) => {
 
   const mutate = useCallback((forceCoord = null) => {
     const current = gridRef.current;
-    const centerX = forceCoord ? forceCoord.x : Math.floor(Math.random() * (cols - 10)) + 5;
-    const centerY = forceCoord ? forceCoord.y : Math.floor(Math.random() * (rows - 10)) + 5;
+    const centerX = forceCoord ? forceCoord.x : Math.floor(rngRef.current() * (cols - 10)) + 5;
+    const centerY = forceCoord ? forceCoord.y : Math.floor(rngRef.current() * (rows - 10)) + 5;
 
-    const patternType = Math.random();
-    const radius = Math.floor(Math.random() * 4) + 3;
+    const patternType = rngRef.current();
+    const radius = Math.floor(rngRef.current() * 4) + 3;
 
     for (let dy = -radius; dy <= radius; dy++) {
       for (let dx = -radius; dx <= radius; dx++) {
@@ -247,16 +279,16 @@ export const useLifeGame = (cols, rows) => {
 
         let shouldInfect = false;
         if (patternType > 0.6) {
-          if (dx * dx + dy * dy < radius * radius) shouldInfect = Math.random() > 0.3;
+          if (dx * dx + dy * dy < radius * radius) shouldInfect = rngRef.current() > 0.3;
         } else if (patternType > 0.3) {
-          if (dx === 0 || dy === 0) shouldInfect = Math.random() > 0.2;
+          if (dx === 0 || dy === 0) shouldInfect = rngRef.current() > 0.2;
         } else {
-          shouldInfect = Math.random() > 0.5;
+          shouldInfect = rngRef.current() > 0.5;
         }
 
         if (shouldInfect) {
           current[idx] = 1;
-          geneRef.current[idx] = Math.floor(Math.random() * 256);
+          geneRef.current[idx] = Math.floor(rngRef.current() * 256);
           if (neuralMode) metaRef.current[idx] = 1.0;
         }
       }
@@ -346,11 +378,11 @@ export const useLifeGame = (cols, rows) => {
           // Heredity: offspring inherit the average gene of their live parents
           // (with drift); survivors keep (and slowly drift) their own gene.
           if (cell > 0) {
-            nextGenes[idx] = driftGene(genes[idx], driftRate);
+            nextGenes[idx] = driftGene(genes[idx], driftRate, rngRef.current);
           } else if (geneCount > 0) {
-            nextGenes[idx] = driftGene(Math.round(geneSum / geneCount), driftRate);
+            nextGenes[idx] = driftGene(Math.round(geneSum / geneCount), driftRate, rngRef.current);
           } else {
-            nextGenes[idx] = Math.floor(Math.random() * 256);
+            nextGenes[idx] = Math.floor(rngRef.current() * 256);
           }
           if (neuralMode) meta[idx] = cell > 0 ? Math.min(meta[idx] + 0.1, 1.0) : avgMeta * 0.9;
         } else {
@@ -392,7 +424,7 @@ export const useLifeGame = (cols, rows) => {
         const ny = (y + dy + rows) % rows;
         const idx = ny * cols + nx;
         current[idx] = target;
-        geneRef.current[idx] = target ? Math.floor(Math.random() * 256) : 0;
+        geneRef.current[idx] = target ? Math.floor(rngRef.current() * 256) : 0;
         if (neuralMode) metaRef.current[idx] = target ? 1.0 : 0;
       }
     }
@@ -410,7 +442,7 @@ export const useLifeGame = (cols, rows) => {
         const wasAlive = current[idx] > 0;
         current[idx] = val;
         if (val > 0) {
-          geneRef.current[idx] = wasAlive ? geneRef.current[idx] : Math.floor(Math.random() * 256);
+          geneRef.current[idx] = wasAlive ? geneRef.current[idx] : Math.floor(rngRef.current() * 256);
         } else {
           geneRef.current[idx] = 0;
         }
@@ -421,7 +453,7 @@ export const useLifeGame = (cols, rows) => {
   };
 
   // For the Gardener: boost metabolic energy + lineage drift inside a region,
-  // favouring NCA births and fresh offspring around a colony.
+  // favouring metabolic births and fresh offspring around a colony.
   const amplifyRegion = useCallback((x, y, radius) => {
     const meta = metaRef.current;
     for (let dy = -radius; dy <= radius; dy++) {
@@ -431,14 +463,14 @@ export const useLifeGame = (cols, rows) => {
         const idx = ny * cols + nx;
         if (gridRef.current[idx] > 0) {
           meta[idx] = 1.0;
-          geneRef.current[idx] = driftGene(geneRef.current[idx], 0.02);
+          geneRef.current[idx] = driftGene(geneRef.current[idx], 0.02, rngRef.current);
         }
       }
     }
     setGrid(new Uint8Array(gridRef.current));
   }, [cols, rows]);
 
-  // Metabolic presence under the cursor: hydrate the soil (meta) so NCA births
+  // Metabolic presence under the cursor: hydrate the soil (meta) so metabolic births
   // are nudged around live cells; dead neighbours warm toward the birth brink.
   const fertilize = useCallback((x, y, radius) => {
     if (computeMode) return;
@@ -451,7 +483,7 @@ export const useLifeGame = (cols, rows) => {
         const idx = ny * cols + nx;
         if (current[idx] > 0) {
           meta[idx] = 1.0;
-          geneRef.current[idx] = driftGene(geneRef.current[idx], 0.01);
+          geneRef.current[idx] = driftGene(geneRef.current[idx], 0.01, rngRef.current);
         } else if (meta[idx] < 0.35) {
           meta[idx] = 0.35;
         }
@@ -569,19 +601,23 @@ export const useLifeGame = (cols, rows) => {
   useEffect(() => {
     if (!active || computeMode) return;
 
-    // Every generation contributes a tagged fitness sample to the window.
-    const { score } = measureFitness();
+    // Every generation contributes a tagged fitness sample to the window,
+    // and lands in the metrics audit log (CSV export).
+    const metrics = measureFitness();
+    const score = metrics.score;
     const window = fitnessWindowRef.current;
     window.push({ rule: ruleStr, score });
     if (window.length > 240) window.shift();
+    metricsRef.current.push({ generation, rule: ruleStr, ...metrics });
+    if (metricsRef.current.length > 5000) metricsRef.current.shift();
 
     if (stormPendingRef.current) return; // a storm is already in flight
 
     const chance = neuralMode ? 0.998 : 0.995;
-    if (Math.random() <= chance) return;
+    if (rngRef.current() <= chance) return;
     const oldRule = ruleStr;
     const randomRules = ['B36/S23', 'B3/S23', 'B2/S23', 'B34/S34', 'B3/S12345'].filter(r => r !== oldRule);
-    const stormRule = randomRules[Math.floor(Math.random() * randomRules.length)];
+    const stormRule = randomRules[Math.floor(rngRef.current() * randomRules.length)];
     stormPendingRef.current = true;
     setRuleStr(stormRule);
     setTimeout(() => {
@@ -630,6 +666,6 @@ export const useLifeGame = (cols, rows) => {
     geneRef, gridRef, metaRef, amplifyRegion, fertilize, suppress,
     ruleStats, measureFitness,
     computeMode, setComputeMode, seedLaneFromBits, laneOutput,
-    restoreSnapshot,
+    restoreSnapshot, reseed, exportMetricsCSV,
   };
 };
