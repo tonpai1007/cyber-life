@@ -384,6 +384,11 @@ const App = () => {
     if (!rendererRef.current) {
       rendererRef.current = new SimulationRenderer(canvas, { cellSize });
     }
+    // Permanent, tiny debug surface — used by support and headless checks.
+    window.__cyber = {
+      renderer: rendererRef.current,
+      stateRef: rendererStateRef,
+    };
     const renderer = rendererRef.current;
     let rafId;
     let renderErrorLogged = 0;

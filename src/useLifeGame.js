@@ -1,55 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { mulberry32 } from './prng';
+import {
+  parseRules,
+  driftGene,
+  stepWorld,
+  stepRule110,
+  computeFitness,
+  fillRandom,
+} from './engine';
 
-// Rule strings look like "B3/S23" (letters optional, any order, digits 0-8).
-// Returns null when the string is not a valid ruleset so callers can keep the
-// last known-good rules instead of silently simulating a dead universe.
-const parseRules = (ruleStr) => {
-  if (typeof ruleStr !== 'string') return null;
-  const parts = ruleStr.trim().toLowerCase().split('/');
-  if (parts.length !== 2) return null;
-  const parseList = (part, letter) => {
-    const digits = part.replace(new RegExp(`^${letter}`), '');
-    if (!/^[0-8]*$/.test(digits)) return null;
-    return [...new Set(digits.split('').map(Number))];
-  };
-  const b = parseList(parts[0], 'b');
-  const s = parseList(parts[1], 's');
-  if (!b || !s) return null;
-  return { b, s };
-};
-
-export const isValidRuleStr = (ruleStr) => parseRules(ruleStr) !== null;
-export { parseRules };
-
-// Rule 110: an elementary cellular automaton proven Turing-complete.
-// Pattern index = (left << 2) | (center << 1) | right; bit = (110 >> index) & 1.
-const RULE_110 = 110;
-
-// Heredity: a gene rarely drifts by +-1 (gradual lineage branching); 2% of the
-// time it "mutates" to a random value. Storm rules raise the drift pressure,
-// which acts as selection pressure on lineage diversity. `rng` is the
-// seeded stream — keep it deterministic for reproducible runs.
-const driftGene = (gene, driftRate, rng) => {
-  if (rng() < driftRate) {
-    if (rng() < 0.02) return Math.floor(rng() * 256);
-    return (gene + (rng() < 0.5 ? 1 : 255)) & 0xff;
-  }
-  return gene;
-};
-
-// Pure survival/birth decision, extracted so it can be unit-tested.
-export const nextAlive = ({ cell, neighbors, avgMeta, b, s, neuralMode }) => {
-  if (neuralMode) {
-    const threshold = 0.45;
-    if (cell > 0) return s.includes(neighbors) || avgMeta > threshold;
-    return b.includes(neighbors) || (neighbors > 1 && avgMeta > 0.7);
-  }
-  return cell > 0 ? s.includes(neighbors) : b.includes(neighbors);
-};
-
-// Pure Rule 110 lookup for a single triple.
-export const rule110Bit = (l, c, r) => (RULE_110 >> ((l << 2) | (c << 1) | r)) & 1;
+// Re-exported so existing consumers (App.jsx, tests) keep working.
+export { parseRules, isValidRuleStr } from './engine';
+export { nextAlive, rule110Bit } from './engine';
 
 export const useLifeGame = (cols, rows, seed = 1) => {
   const [active, setActive] = useState(false);
@@ -154,9 +116,11 @@ export const useLifeGame = (cols, rows, seed = 1) => {
     ensureBuffers(); // make sure gridRef matches the current cols x rows
     const newGrid = new Uint8Array(cols * rows);
     if (source === true) {
-      for (let i = 0; i < newGrid.length; i++) {
-        if (rngRef.current() > 0.85) newGrid[i] = 1;
-      }
+      fillRandom(
+        { grid: newGrid, genes: geneRef.current, meta: metaRef.current, generation: 0 },
+        0.85,
+        rngRef.current
+      );
     } else if (source instanceof Uint8Array && source.length === newGrid.length) {
       newGrid.set(source);
     } else if (source instanceof Uint8Array) {
@@ -302,101 +266,32 @@ export const useLifeGame = (cols, rows, seed = 1) => {
 
   const step = useCallback(() => {
     ensureBuffers();
-    const current = gridRef.current;
-    const next = backBufferRef.current;
-    const genes = geneRef.current;
-    const nextGenes = geneBackRef.current;
+    const world = {
+      cols,
+      rows,
+      grid: gridRef.current,
+      next: backBufferRef.current,
+      meta: metaRef.current,
+      genes: geneRef.current,
+      geneBack: geneBackRef.current,
+      generation: 0,
+    };
 
     // Pure computation mode: the grid is the spacetime diagram of a 1D
     // elementary cellular automaton. Row 0 is the seed; every row below is
-    // Rule 110 applied to the row above. Turing-complete, honest computing.
+    // Rule 110 applied to the row above.
     if (computeMode) {
-      for (let y = 1; y < rows; y++) {
-        const up = (y - 1) * cols;
-        const row = y * cols;
-        for (let x = 0; x < cols; x++) {
-          const l = current[up + ((x - 1 + cols) % cols)];
-          const c = current[up + x];
-          const r = current[up + ((x + 1) % cols)];
-          next[row + x] = rule110Bit(l, c, r);
-          nextGenes[row + x] = next[row + x] ? 180 : 0;
-        }
-      }
-      for (let x = 0; x < cols; x++) {
-        next[x] = current[x];
-        nextGenes[x] = genes[x];
-      }
-      let out = '';
-      const last = (rows - 1) * cols;
-      for (let x = 0; x < Math.min(cols, 128); x += 4) {
-        let nib = 0;
-        for (let bb = 0; bb < 4; bb++) nib = (nib << 1) | next[last + x + bb];
-        out += nib.toString(16);
-      }
+      const out = stepRule110(world);
       setLaneOutput(out);
-      gridRef.current.set(next);
-      geneRef.current.set(nextGenes);
-      setGrid(new Uint8Array(next));
+      setGrid(new Uint8Array(world.grid));
       setIsStagnant(false);
       setGeneration(prev => prev + 1);
       return;
     }
 
-    const meta = metaRef.current;
     const { b, s } = rules.current;
     const driftRate = ruleStrRef.current !== 'B3/S23' ? 0.06 : 0.015;
-
-    for (let y = 0; y < rows; y++) {
-      for (let x = 0; x < cols; x++) {
-        let neighbors = 0;
-        let avgMeta = 0;
-        let geneSum = 0;
-        let geneCount = 0;
-        for (let i = -1; i <= 1; i++) {
-          for (let j = -1; j <= 1; j++) {
-            if (i === 0 && j === 0) continue;
-            const nx = (x + i + cols) % cols;
-            const ny = (y + j + rows) % rows;
-            const nidx = ny * cols + nx;
-            if (current[nidx] > 0) {
-              neighbors++;
-              avgMeta += meta[nidx];
-              geneSum += genes[nidx];
-              geneCount++;
-            }
-          }
-        }
-        avgMeta = neighbors > 0 ? avgMeta / neighbors : 0;
-
-        const idx = y * cols + x;
-        const cell = current[idx];
-
-        const alive = nextAlive({ cell, neighbors, avgMeta, b, s, neuralMode });
-
-        if (alive) {
-          next[idx] = Math.min(cell + 1, 10);
-          // Heredity: offspring inherit the average gene of their live parents
-          // (with drift); survivors keep (and slowly drift) their own gene.
-          if (cell > 0) {
-            nextGenes[idx] = driftGene(genes[idx], driftRate, rngRef.current);
-          } else if (geneCount > 0) {
-            nextGenes[idx] = driftGene(Math.round(geneSum / geneCount), driftRate, rngRef.current);
-          } else {
-            nextGenes[idx] = Math.floor(rngRef.current() * 256);
-          }
-          if (neuralMode) meta[idx] = cell > 0 ? Math.min(meta[idx] + 0.1, 1.0) : avgMeta * 0.9;
-        } else {
-          next[idx] = 0;
-          nextGenes[idx] = 0;
-          if (neuralMode) meta[idx] *= cell > 0 ? 0.8 : 0.5;
-        }
-      }
-    }
-
-    let hash = 0;
-    for (let i = 0; i < next.length; i++) {
-      if (next[i]) hash = (hash ^ i) + (hash << 5) + hash;
-    }
+    const hash = stepWorld(world, { neuralMode, b, s, driftRate, rng: rngRef.current });
 
     if (historyRef.current.includes(hash)) {
       setIsStagnant(true);
@@ -405,9 +300,7 @@ export const useLifeGame = (cols, rows, seed = 1) => {
       setIsStagnant(false);
     }
 
-    gridRef.current.set(next);
-    geneRef.current.set(nextGenes);
-    setGrid(new Uint8Array(next));
+    setGrid(new Uint8Array(world.grid));
     setGeneration(prev => prev + 1);
   }, [cols, rows, neuralMode, computeMode, ensureBuffers]);
 
@@ -509,61 +402,10 @@ export const useLifeGame = (cols, rows, seed = 1) => {
     setGrid(new Uint8Array(current));
   }, [cols, rows, computeMode]);
 
-  // Fitness of the current world: density entropy x connectivity x lineage
-  // diversity x longevity. Scores ~0..7; higher = more "alive".
-  const measureFitness = useCallback(() => {
-    const current = gridRef.current;
-    const genes = geneRef.current;
-    let count = 0;
-    let ageSum = 0;
-    const geneSet = new Set();
-    for (let i = 0; i < current.length; i++) {
-      if (current[i] > 0) {
-        count++;
-        ageSum += current[i];
-        geneSet.add(genes[i]);
-      }
-    }
-    const cellCount = cols * rows;
-    const p = cellCount > 0 ? count / cellCount : 0;
-    const entropy = p > 0 && p < 1 ? -(p * Math.log(p) + (1 - p) * Math.log(1 - p)) : 0;
-
-    let components = 0;
-    if (count > 0) {
-      const visited = new Uint8Array(cols * rows);
-      for (let si = 0; si < current.length; si++) {
-        if (current[si] === 0 || visited[si]) continue;
-        components++;
-        const stack = [si];
-        visited[si] = 1;
-        while (stack.length) {
-          const idx = stack.pop();
-          const cx = idx % cols;
-          const cy = Math.floor(idx / cols);
-          for (let a = -1; a <= 1; a++) {
-            for (let b = -1; b <= 1; b++) {
-              if (a === 0 && b === 0) continue;
-              const nx = (cx + a + cols) % cols;
-              const ny = (cy + b + rows) % rows;
-              const nidx = ny * cols + nx;
-              if (current[nidx] > 0 && !visited[nidx]) {
-                visited[nidx] = 1;
-                stack.push(nidx);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    const avgAge = count ? ageSum / count : 0;
-    const score =
-      entropy * 2 +
-      Math.min(components / 30, 1.5) +
-      Math.min(geneSet.size / 40, 1.5) +
-      Math.min(avgAge / 4, 1.5);
-    return { score, population: count, entropy, components, diversity: geneSet.size, avgAge };
-  }, [cols, rows]);
+  const measureFitness = useCallback(
+    () => computeFitness({ cols, rows, grid: gridRef.current, genes: geneRef.current }),
+    [cols, rows]
+  );
 
   const recordRule = useCallback((rule, fitness) => {
     const rec = ruleStatsRef.current[rule] || { rule, avg: 0, samples: 0, adopted: false };
